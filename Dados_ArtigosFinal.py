@@ -1,35 +1,29 @@
 import requests
 from bs4 import BeautifulSoup
 from neo4j import GraphDatabase
+import time
 
-# --- CONFIGURAÇÕES ---
+# --- CONFIGURAÇÕES DO NEO4J ---
 URI = "neo4j+s://17d5c27a.databases.neo4j.io"
 USER = "17d5c27a"
 PASSWORD = "cnBdJkxHF7GXaSkwnqFfxihdOFqwvBvb0GgSXFfxfng"
 
-# LISTA ESCALÁVEL - Você pode adicionar 100 links aqui se quiser
-URLS = [
-    "https://journals-sol.sbc.org.br/index.php/jidm/article/view/3383",
-    "https://journals-sol.sbc.org.br/index.php/jidm/article/view/3657",
-    "https://journals-sol.sbc.org.br/index.php/jidm/article/view/4116"
-]
-
-def extrair_dados_reais(url):
+def extrair_dados(url):
     headers = {'User-Agent': 'Mozilla/5.0'}
     try:
-        response = requests.get(url, headers=headers, timeout=10)
+        response = requests.get(url, headers=headers, timeout=15)
         soup = BeautifulSoup(response.text, 'html.parser')
 
+        # Título
         titulo_tag = soup.find("h1", class_="page_title")
         if not titulo_tag: return None
-        
         titulo = titulo_tag.get_text(strip=True)
 
         # Data
         data_div = soup.find("div", class_="item published") or soup.find("section", class_="item published")
         data_pub = data_div.find("span", class_="value").get_text(strip=True) if data_div and data_div.find("span", class_="value") else "Data Desconhecida"
 
-        # Volume
+        # Volume/Edição
         volume_tag = soup.find("section", class_="item issue") or soup.find("div", class_="item issue")
         volume_info = volume_tag.find("a", class_="title").get_text(strip=True) if volume_tag and volume_tag.find("a", class_="title") else "Volume Indefinido"
 
@@ -61,33 +55,27 @@ def extrair_dados_reais(url):
             "autores": autores_lista, "keywords": keywords, "url": url
         }
     except Exception as e:
-        print(f"⚠️ Erro ao extrair {url}: {e}")
+        print(f"⚠️ Erro ao acessar {url}: {e}")
         return None
 
 def salvar_no_neo4j(tx, dados):
-    """Função que executa as queries dentro de uma transação aberta"""
-    # MERGE garante que se o nó já existe, ele não duplica, apenas conecta.
+    # Cria o Artigo
     tx.run("MERGE (a:Artigo {titulo: $titulo}) SET a.url = $url", titulo=dados['titulo'], url=dados['url'])
+    
+    # Conecta Data
+    tx.run("MATCH (a:Artigo {titulo: $titulo}) MERGE (d:Data {valor: $data}) MERGE (a)-[:PUBLICADO_EM]->(d)", 
+           titulo=dados['titulo'], data=dados['data'])
+    
+    # Conecta Volume
+    tx.run("MATCH (a:Artigo {titulo: $titulo}) MERGE (v:Volume {nome: $vol}) MERGE (a)-[:PERTENCE_AO_VOLUME]->(v)", 
+           titulo=dados['titulo'], vol=dados['volume'])
 
-    tx.run("""
-        MATCH (a:Artigo {titulo: $titulo})
-        MERGE (d:Data {valor: $data})
-        MERGE (a)-[:PUBLICADO_EM]->(d)
-    """, titulo=dados['titulo'], data=dados['data'])
-
-    tx.run("""
-        MATCH (a:Artigo {titulo: $titulo})
-        MERGE (v:Volume {nome: $vol})
-        MERGE (a)-[:PERTENCE_AO_VOLUME]->(v)
-    """, titulo=dados['titulo'], vol=dados['volume'])
-
+    # Conecta DOI
     if dados['doi'] != "Sem DOI":
-        tx.run("""
-            MATCH (a:Artigo {titulo: $titulo})
-            MERGE (id:DOI {codigo: $doi})
-            MERGE (a)-[:IDENTIFICADO_POR]->(id)
-        """, titulo=dados['titulo'], doi=dados['doi'])
+        tx.run("MATCH (a:Artigo {titulo: $titulo}) MERGE (id:DOI {codigo: $doi}) MERGE (a)-[:IDENTIFICADO_POR]->(id)", 
+               titulo=dados['titulo'], doi=dados['doi'])
 
+    # Conecta Autores e Instituições
     for autor in dados['autores']:
         tx.run("""
             MATCH (a:Artigo {titulo: $titulo})
@@ -97,28 +85,34 @@ def salvar_no_neo4j(tx, dados):
             MERGE (au)-[:AFILIADO_A]->(i)
         """, titulo=dados['titulo'], nome=autor['nome'], inst=autor['inst'])
 
+    # Conecta Keywords
     for kw in dados['keywords']:
-        tx.run("""
-            MATCH (a:Artigo {titulo: $titulo})
-            MERGE (k:PalavraChave {nome: $kw})
-            MERGE (a)-[:TEM_ASSUNTO]->(k)
-        """, titulo=dados['titulo'], kw=kw)
+        tx.run("MATCH (a:Artigo {titulo: $titulo}) MERGE (k:PalavraChave {nome: $kw}) MERGE (a)-[:TEM_ASSUNTO]->(k)", 
+               titulo=dados['titulo'], kw=kw)
 
 if __name__ == "__main__":
+    # 1. Carregar links do arquivo
+    with open("links_artigos.txt", "r") as f:
+        linhas = f.readlines()
+    
+    # Filtrar apenas o que começa com http
+    urls_para_processar = [l.strip() for l in linhas if l.startswith("http")]
+    
+    print(f"📂 Encontrados {len(urls_para_processar)} links para processar.")
+    
     driver = GraphDatabase.driver(URI, auth=(USER, PASSWORD))
     
     with driver.session() as session:
-        for url in URLS:
-            print(f"🔍 Processando: {url}")
-            dados = extrair_dados_reais(url)
+        for i, url in enumerate(urls_para_processar):
+            print(f"[{i+1}/{len(urls_para_processar)}] 🔍 Extraindo: {url}")
+            dados = extrair_dados(url)
             
             if dados:
-                # Executa todas as inserções para um artigo de uma vez
                 session.execute_write(salvar_no_neo4j, dados)
-                print(f"✅ Inserido: {dados['titulo']}")
-            else:
-                print(f"❌ Falha ao obter dados de: {url}")
+                print(f"✅ Sucesso: {dados['titulo'][:50]}...")
+            
+            # Pequena pausa para não sobrecarregar o site da revista
+            time.sleep(1)
 
     driver.close()
-    print("\n🚀 Grafo atualizado com sucesso!")
-    
+    print("\n🚀 Grafo populado com sucesso com todos os artigos do arquivo!")
